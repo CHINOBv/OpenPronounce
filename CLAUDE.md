@@ -17,8 +17,8 @@ First regression case (`docs/vision.md` §7, §22): expected `ship`, produced �
 ## Commands
 
 ```bash
-# Dev dependencies (pytest is not installed in .venv by default)
-.venv/Scripts/python.exe -m pip install -e ".[app,dev]"
+# Dev dependencies (.venv is uv-managed and has no pip)
+uv pip install --python .venv/Scripts/python.exe -e ".[app,dev]"
 
 # Tests (same as CI: .github/workflows/tests.yml)
 .venv/Scripts/python.exe -m pytest
