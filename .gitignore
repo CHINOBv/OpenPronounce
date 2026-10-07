@@ -14,3 +14,7 @@ test_env
 .env
 .env.*
 .claude/
+# Personal lab data (voice recordings, run outputs) stays local
+lab/corpus/audio/*
+!lab/corpus/audio/.gitkeep
+lab/runs/

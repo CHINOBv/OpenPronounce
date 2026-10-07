@@ -1,0 +1,6 @@
+sample_id,expected_text,intended_pronunciation,label,audio_file,target_phoneme,intended_substitution,microphone,recording_context,recorded_on,notes
+ship_good_01,ship,ship,good,audio/ship_good_01.wav,,,,,,baseline take 1
+ship_good_02,ship,ship,good,audio/ship_good_02.wav,,,,,,baseline take 2 (stability)
+ship_as_sheep_01,ship,sheep,intentional_error,audio/ship_as_sheep_01.wav,ɪ,ɪ->iː,,,,vowel contrast /ɪ/ vs /iː/
+ship_as_chip_01,ship,chip,intentional_error,audio/ship_as_chip_01.wav,ʃ,ʃ->tʃ,,,,"first regression case (docs/vision.md §7, §22)"
+ship_as_sip_01,ship,sip,intentional_error,audio/ship_as_sip_01.wav,ʃ,ʃ->s,,,,consonant contrast /ʃ/ vs /s/
