@@ -75,14 +75,12 @@ def load_corpus(path, skip_missing=False, only=None):
     # utf-8-sig drops the BOM that Excel and Notepad add to "UTF-8" CSV files.
     with open(path, encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
-        header = [name.strip() for name in next(reader, [])]
-        rows = []
-        for values in reader:
-            if any(v.strip() for v in values):
-                rows.append((reader.line_num, values))
+        # Blank lines (or rows of empty cells) are skipped everywhere, before the header too.
+        rows = [(reader.line_num, values) for values in reader if any(v.strip() for v in values)]
 
-    if not header:
+    if not rows:
         raise CorpusError(path, ["the file is empty (no header row)"])
+    header = [name.strip() for name in rows.pop(0)[1]]
     missing_columns = [c for c in REQUIRED_COLUMNS if c not in header]
     if missing_columns:
         problems.append(f"missing required column(s): {', '.join(missing_columns)}")
@@ -92,14 +90,25 @@ def load_corpus(path, skip_missing=False, only=None):
     columns = header + [c for c in REQUIRED_COLUMNS + OPTIONAL_COLUMNS if c not in header]
 
     samples = []
-    first_line = {}
+    first_seen = {}  # lower-cased sample_id -> (line, sample_id) of its first row
     for line, values in rows:
         if len(values) > len(header):
             problems.append(f"line {line}: {len(values)} fields, the header has {len(header)}")
             continue
         fields = dict.fromkeys(columns, "")
         fields.update(zip(header, (v.strip() for v in values)))
-        problems.extend(f"line {line}: {p}" for p in _row_problems(fields, header, line, first_line))
+        row_problems = list(_row_problems(fields, header))
+        sample_id = fields["sample_id"]
+        if SAMPLE_ID_RE.fullmatch(sample_id):
+            # Ids name output files, and Windows file names ignore case: Ship_01 and ship_01 collide.
+            key = sample_id.lower()
+            if key not in first_seen:
+                first_seen[key] = (line, sample_id)
+            else:
+                first_line, first_id = first_seen[key]
+                same = "" if first_id == sample_id else f" as {first_id!r}; ids differing only in case collide"
+                row_problems.insert(0, f"duplicate sample_id {sample_id!r} (first on line {first_line}{same})")
+        problems.extend(f"line {line}: {p}" for p in row_problems)
         audio_file = fields["audio_file"]
         samples.append(Sample(line, fields, os.path.normpath(os.path.join(base_dir, audio_file))))
 
@@ -124,8 +133,8 @@ def load_corpus(path, skip_missing=False, only=None):
     return Corpus(path, columns, present, missing)
 
 
-def _row_problems(fields, header, line, first_line):
-    """Problems of one row; ``first_line`` maps the sample ids seen so far to their line.
+def _row_problems(fields, header):
+    """Problems of one row on its own (duplicates are checked across rows by the caller).
 
     Columns absent from ``header`` are already reported once, so they are not checked per row.
     """
@@ -135,10 +144,6 @@ def _row_problems(fields, header, line, first_line):
             yield "sample_id is empty"
         elif not SAMPLE_ID_RE.fullmatch(sample_id):
             yield f"sample_id {sample_id!r} must match {SAMPLE_ID_RE.pattern} (it names the output files)"
-        elif sample_id in first_line:
-            yield f"duplicate sample_id {sample_id!r} (first on line {first_line[sample_id]})"
-        else:
-            first_line[sample_id] = line
     if "expected_text" in header and not fields["expected_text"]:
         yield "expected_text is empty"
     if "label" in header and fields["label"] not in LABELS:

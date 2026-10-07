@@ -40,11 +40,11 @@ Fill in `microphone`, `recording_context` and `recorded_on` as you record. While
 
 ## Corpus CSV
 
-UTF-8 (a BOM from Excel is fine), one row per recording. Unknown extra columns are kept and copied to the outputs.
+UTF-8 (a BOM from Excel is fine), one row per recording; blank lines are ignored, also before the header. Unknown extra columns are kept and copied to the outputs. A row with more cells than the header is an error; missing trailing cells are empty.
 
 | Column | Required | Content |
 |---|---|---|
-| `sample_id` | yes | Unique, letters, digits, `_` and `-` only; names the output files |
+| `sample_id` | yes | Unique even ignoring case (`Ship_01` and `ship_01` would share a file on Windows), letters, digits, `_` and `-` only; names the output files |
 | `expected_text` | yes | What the pipeline is told you said |
 | `intended_pronunciation` | yes (may be empty) | What you actually tried to produce, e.g. `chip` |
 | `label` | yes | `good`, `intentional_error` or `uncertain` |
@@ -74,7 +74,17 @@ Validation lists every problem at once (line number and reason) and stops before
 | `--skip-missing` | off | Skip rows whose audio file does not exist yet (listed in the report) |
 | `--validate-only` | off | Check the corpus and stop; no model, no output |
 
-Before the first sample, a preflight checks that espeak-ng returns phones; without it the pipeline would silently report no errors. Exit codes: `0` done (even if some samples failed, they are in the report), `2` invalid corpus, `3` preflight failed, `4` nothing to evaluate. The first real run downloads the models from Hugging Face.
+Before the first sample, a preflight checks that espeak-ng returns phones (without it the pipeline would silently report no errors) and makes the TTS reference of every distinct `expected_text` with the pipeline's own call: cached references cost nothing, missing ones are synthesized then (gTTS, the default, needs network access; offline backends are in [`docs/reference-voice.md`](../docs/reference-voice.md)). The first real run downloads the models from Hugging Face, so the first analyzed sample's elapsed time includes model loading (`cold_start` in its raw record, noted in the report).
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Done, even if some samples failed (they are in the report) |
+| `1` | Unexpected error (traceback); `run.json` says `aborted` if the run had started |
+| `2` | Usage error (bad flag or `--name`) |
+| `3` | Invalid corpus |
+| `4` | Preflight failed |
+| `5` | Nothing to evaluate |
+| `130` | Interrupted (Ctrl+C); the partial run is kept |
 
 ## Outputs
 
@@ -82,12 +92,13 @@ Each run writes `lab/runs/<YYYYMMDD-HHMMSS>[-<name>]/`:
 
 | File | Content |
 |---|---|
-| `raw/<sample_id>.json` | The CSV row, audio path, sha256 and duration, the full pipeline output (prosody included), per-word phone reports of every word (`diagnostics.word_reports`, also below the reporting threshold), the error if the sample failed, elapsed time |
-| `results.jsonl` | One line per sample: score, acoustic distance, ASR, PER, WER, expected and heard phones with confidences, reported errors, feedback, weighted edits per word, `detection`, `flags`. No prosody |
-| `run.json` | Timestamps, arguments, corpus sha256, git commit and dirty flag, package and espeak-ng versions, TTS backend, device, models, phone thresholds, counts, summary |
-| `report.md` | Summary (TP/FP/TN/FN, precision, recall, score range per label, positive feedback on intentional errors), one row per sample, then word-level edits next to the reporting threshold |
+| `raw/<sample_id>.json` | The CSV row, audio path, sha256 and duration, the TTS reference (`reference`: path in the run, sha256, cache source), the full pipeline output (prosody included), per-word phone reports of every word (`diagnostics.word_reports`, also below the reporting threshold; `diagnostics.error` if computing them failed, the result stands), the error if the sample failed (`stage`: `analysis`, or `row` when its results line could not be derived; the pipeline output is kept), elapsed time, `cold_start` |
+| `references/<sample_id>.wav` | Copy of the TTS reference the acoustic distance was measured against |
+| `results.jsonl` | One line per sample: score, acoustic distance, reference sha256, ASR, PER, WER, expected and heard phones with confidences, reported errors, feedback, weighted edits per word (with word position), `detection`, `flags`. No prosody |
+| `run.json` | `status` (`running` while the run goes, then `completed`, `interrupted` or `aborted`), timestamps, arguments, corpus sha256, git commit and dirty flag, package and espeak-ng versions, TTS backend, device, models and their Hugging Face revisions (`model_revisions`, the commit in the local cache; `null` when not cached or a local path), phone thresholds, counts (`not_run` after an interruption), summary |
+| `report.md` | Summary (TP/FP/TN/FN, precision, recall, score range per label, positive feedback on intentional errors), one row per sample, then word-level edits (`word #position`, 3 decimals) next to the reporting threshold. Written for the finished samples also when the run is interrupted |
 
-`flags` are facts, not judgments: `positive_feedback` (the feedback says "excellent"), `asr_mismatch` (ASR words differ from the expected words), `no_expected_phones` (espeak-ng gave nothing), `no_heard_phones`.
+`flags` are facts, not judgments: `positive_feedback` (the feedback says "excellent"), `asr_mismatch` (ASR words differ from the expected words), `no_expected_phones` (espeak-ng gave nothing), `no_heard_phones`, `missing_words_with_errors` (the result has no `words_with_errors`, so the detection is unknown: NA).
 
 ## Privacy
 

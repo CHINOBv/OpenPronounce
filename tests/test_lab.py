@@ -1,16 +1,19 @@
 """Tests of the evaluation harness (``lab/``). No model is loaded: the pipeline is faked."""
 
+import contextlib
 import csv
+import datetime
 import glob
 import hashlib
 import inspect
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import numpy as np
 import soundfile as sf
@@ -69,6 +72,20 @@ def row(sample_id, label, words_with_errors=(), feedback=FEEDBACK_OK, score=90.0
         "detection": report.detection(label, list(words_with_errors), failed=failed),
         "flags": None if failed else {"positive_feedback": "excellent" in feedback.lower()},
         "error": {"type": "RuntimeError", "message": "boom"} if failed else None,
+    }
+
+
+def record(result, diagnostics=None, label="intentional_error", sample_id="ship_as_chip_01"):
+    """A raw record, as built by evaluate.evaluate_sample."""
+    return {
+        "sample": {"sample_id": sample_id, "label": label, "expected_text": "ship", "intended_pronunciation": "chip"},
+        "audio": {"path": "audio/x.wav", "sha256": "0" * 64, "duration_s": 0.5},
+        "reference": None,
+        "result": result,
+        "diagnostics": diagnostics,
+        "error": None,
+        "elapsed_s": 1.0,
+        "cold_start": False,
     }
 
 
@@ -134,6 +151,49 @@ class TestCorpus(unittest.TestCase):
         self.assertEqual(len(ctx.exception.problems), 6)
         # The message lists everything too.
         self.assertIn("missing.wav", str(ctx.exception))
+
+    def test_ids_that_differ_only_in_case_are_duplicates(self):
+        # Ship_01 and ship_01 would write the same raw/<id>.json on Windows.
+        write_csv(self.csv, HEADER, [
+            ["Ship_01", "ship", "ship", "good", self.audio("a.wav")],
+            ["ship_01", "ship", "ship", "good", self.audio("b.wav")],
+        ])
+        with self.assertRaises(corpus.CorpusError) as ctx:
+            corpus.load_corpus(self.csv)
+        (problem,) = ctx.exception.problems
+        self.assertIn("line 3", problem)
+        self.assertIn("'ship_01'", problem)
+        self.assertIn("'Ship_01'", problem)
+
+    def test_blank_leading_lines_are_skipped(self):
+        with open(self.csv, "w", encoding="utf-8", newline="") as f:
+            f.write("\n  \n,,,\n")
+            writer = csv.writer(f)
+            writer.writerow(HEADER)
+            writer.writerow(["ship_good_01", "ship", "ship", "good", self.audio("a.wav")])
+        result = corpus.load_corpus(self.csv)
+        self.assertEqual([s.sample_id for s in result.samples], ["ship_good_01"])
+        self.assertEqual(result.samples[0].row, 5)  # line numbers stay those of the file
+
+    def test_only_blank_lines_is_empty(self):
+        with open(self.csv, "w", encoding="utf-8") as f:
+            f.write("\n\n")
+        with self.assertRaises(corpus.CorpusError) as ctx:
+            corpus.load_corpus(self.csv)
+        self.assertIn("empty", ctx.exception.problems[0])
+
+    def test_row_width(self):
+        write_csv(self.csv, HEADER, [
+            ["wide", "ship", "ship", "good", self.audio("a.wav"), "stray"],
+            ["short", "ship", "ship"],  # missing cells are empty, so the required ones are reported
+        ])
+        with self.assertRaises(corpus.CorpusError) as ctx:
+            corpus.load_corpus(self.csv)
+        self.assertEqual(ctx.exception.problems, [
+            "line 2: 6 fields, the header has 5",
+            "line 3: label '' must be one of: good, intentional_error, uncertain",
+            "line 3: audio_file is empty",
+        ])
 
     def test_skip_missing(self):
         write_csv(self.csv, HEADER, [
@@ -203,6 +263,9 @@ class TestDetection(unittest.TestCase):
             ("uncertain", ["ship"], False, "NA"),
             ("good", [], True, "NA"),
             ("intentional_error", ["ship"], True, "NA"),
+            # No words_with_errors in the result: unknown, not "nothing flagged".
+            ("good", None, False, "NA"),
+            ("intentional_error", None, False, "NA"),
         ]
         for label, words, failed, expected in cases:
             with self.subTest(label=label, words=words, failed=failed):
@@ -246,6 +309,20 @@ class TestFlags(unittest.TestCase):
         del result["differences"]["heard_phones"]
         self.assertTrue(report.flags(result, "ship")["no_heard_phones"])
 
+    def test_missing_words_with_errors(self):
+        self.assertFalse(self.flags()["missing_words_with_errors"])
+        result = fake_result(26.3, "TRIP", ["tʃ", "y", "p"], [0.9, 0.1, 0.9], [], FEEDBACK_OK)
+        del result["differences"]["words_with_errors"]
+        self.assertTrue(report.flags(result, "ship")["missing_words_with_errors"])
+        row_ = report.result_row(record(result))
+        self.assertEqual(row_["detection"], "NA")
+        summary = report.summarize([row_])
+        self.assertEqual(summary["counts"]["FN"], 0)
+        self.assertEqual(summary["unknown_detection"], ["ship_as_chip_01"])
+        markdown = report.render_markdown({"summary": summary}, [row_], {})
+        self.assertIn("no `words_with_errors`", markdown)
+        self.assertIn("ship_as_chip_01", markdown)
+
 
 class TestSummary(unittest.TestCase):
 
@@ -282,17 +359,93 @@ class TestSummary(unittest.TestCase):
         self.assertIsNone(summary["precision"])
 
 
+class TestMarkdown(unittest.TestCase):
+
+    def test_tts_label(self):
+        def header(tts):
+            return "\n".join(report._header({"tts": tts}, []))
+
+        # The gTTS "voice" is the Google Translate domain.
+        self.assertIn("gtts (tld com)", header({"backend": "gtts", "voice": "com"}))
+        self.assertIn("piper (voice en_US-lessac-medium)", header({"backend": "piper", "voice": "en_US-lessac-medium"}))
+        self.assertIn("unavailable: unknown backend 'x'", header({"error": "unknown backend 'x'"}))
+
+    def test_every_heard_phone_is_shown(self):
+        self.assertEqual(report._heard_phones_text(["tʃ", "y", "p"], [0.91, 0.12, 0.98]), "tʃ(0.91) y(0.12) p(0.98)")
+        self.assertEqual(report._heard_phones_text(["tʃ", "y", "p"], [0.91]), "tʃ(0.91) y(?) p(?)")
+        self.assertEqual(report._heard_phones_text(["tʃ", "y"], None), "tʃ(?) y(?)")
+
+    def test_word_level_positions_and_decimals(self):
+        result = fake_result(40.0, "SHIP SHIP", ["ʃ", "ɪ", "p", "tʃ", "ɪ", "p"], [0.9] * 6, [], FEEDBACK_OK)
+        reports = [
+            {"position": 0, "word": "ship", "expected": ["ʃ", "ɪ", "p"], "actual": ["ʃ", "ɪ", "p"],
+             "distance": 0, "phones": [], "weighted_edits": 0.0},
+            {"position": 1, "word": "ship", "expected": ["ʃ", "ɪ", "p"], "actual": ["tʃ", "ɪ", "p"],
+             "distance": 1, "weighted_edits": 1.199,
+             "phones": [{"expected": "ʃ", "heard": "tʃ", "confidence": 1.199}]},
+        ]
+        row_ = report.result_row(record(result, {"word_reports": reports}))
+        self.assertEqual([w["position"] for w in row_["word_edits"]], [0, 1])
+        run = {"phone_thresholds": {"PHONE_ERROR_THRESHOLD": 0.4, "PHONE_ERROR_MIN_EDITS": 2}}
+        markdown = "\n".join(report._word_section(run, [row_], {"ship_as_chip_01": reports}))
+        self.assertIn("| ship #0 |", markdown)
+        self.assertIn("| ship #1 |", markdown)
+        self.assertIn("- ship #1: ʃ → tʃ (1.20)", markdown)
+        # Three decimals: 1.199 is below the 1.200 at which a 3-phone word is reported.
+        self.assertIn("| 1.199 | 1.200 | no |", markdown)
+
+    def test_diagnostics_error_is_surfaced(self):
+        result = fake_result(26.3, "TRIP", ["tʃ", "y", "p"], [0.91, 0.12, 0.98], [], FEEDBACK_OK)
+        diagnostics = {"word_reports": None, "error": {"stage": "diagnostics", "type": "KeyError",
+                                                       "message": "'position'", "traceback": "..."}}
+        row_ = report.result_row(record(result, diagnostics))
+        # The pipeline result still drives detection and flags.
+        self.assertEqual(row_["detection"], "FN")
+        self.assertTrue(row_["flags"]["positive_feedback"])
+        self.assertEqual(row_["diagnostics_error"], {"stage": "diagnostics", "type": "KeyError", "message": "'position'"})
+        markdown = "\n".join(report._word_section({}, [row_], {}))
+        self.assertIn("Phone-level diagnostics failed: KeyError: 'position'", markdown)
+
+    def test_cold_start_note(self):
+        rows = [dict(row("g1", "good"), elapsed_s=12.5, cold_start=True),
+                dict(row("g2", "good"), elapsed_s=1.5, cold_start=False)]
+        header = "\n".join(report._header({}, rows))
+        self.assertIn("g1 (12.5 s) includes lazy model loading", header)
+
+
+class TestReportingRule(unittest.TestCase):
+    """report._reporting_value restates the compare_phones rule for display; it must not drift."""
+
+    def test_matches_compare_phones(self):
+        from openpronounce import phones
+
+        thresholds = {name: getattr(phones, name) for name in evaluate.PHONE_THRESHOLDS}
+        for n_phones in range(1, 9):
+            value = report._reporting_value(n_phones, thresholds)
+            for edits in (value - 1e-6, value + 1e-6):
+                word = {"position": 0, "word": "w", "expected": ["p"] * n_phones, "actual": [], "distance": 1,
+                        "phones": [], "weighted_edits": edits}
+                # Synthetic word report and expected phones: no espeak-ng, no model.
+                with patch.object(phones, "get_expected_phones", return_value=(["w"], [["p"] * n_phones])), \
+                        patch.object(phones, "_word_reports", return_value=[word]):
+                    reported = bool(phones.compare_phones([], "w", "en")["words_with_errors"])
+                with self.subTest(n_phones=n_phones, edits=edits):
+                    self.assertEqual(reported, edits > value)
+
+
 # ---------------------------------------------------------------------------
 # Real analyzer: capture of the phone recognition (pipeline faked)
 # ---------------------------------------------------------------------------
 
 class TestPipelineCapture(unittest.TestCase):
 
-    def test_speech_calls_recognize_phones_through_the_module(self):
-        # The capture in evaluate.analyze_with_pipeline relies on this call shape.
+    def test_speech_calls_the_captured_functions_through_their_modules(self):
+        # The captures in evaluate.analyze_with_pipeline rely on this call shape.
         from openpronounce import speech
 
-        self.assertIn("phones.recognize_phones(", inspect.getsource(speech.compare_audio_with_text))
+        source = inspect.getsource(speech.compare_audio_with_text)
+        self.assertIn("phones.recognize_phones(", source)
+        self.assertIn("audio.text2speech(", source)
 
     def test_word_reports_contract(self):
         # Keys that report.result_row reads from the private phones._word_reports (espeak, no model).
@@ -326,23 +479,79 @@ class TestPipelineCapture(unittest.TestCase):
         self.assertEqual(diagnostics["word_reports"][0]["weighted_edits"], 1.5)
         json.dumps(diagnostics)  # numpy values were converted
 
-    def test_no_diagnostics_without_phone_recognition(self):
+    def test_no_word_reports_without_phone_recognition(self):
         from openpronounce import phones
 
         original = phones.recognize_phones
         with patch("openpronounce.speech.compare_audio_with_text", return_value={"language": "en"}):
             _, diagnostics = evaluate.analyze_with_pipeline(np.zeros(16000), "ship", "en")
-        self.assertIsNone(diagnostics)
+        self.assertIsNone(diagnostics["word_reports"])
+        self.assertIsNone(diagnostics["reference_audio"])
+        self.assertNotIn("error", diagnostics)
         self.assertIs(phones.recognize_phones, original)
 
-    def test_recognize_phones_is_restored_on_failure(self):
-        from openpronounce import phones
+    def test_captured_functions_are_restored_on_failure(self):
+        from openpronounce import audio, phones
 
-        original = phones.recognize_phones
+        originals = phones.recognize_phones, audio.text2speech
         with patch("openpronounce.speech.compare_audio_with_text", side_effect=RuntimeError("tts down")):
             with self.assertRaises(RuntimeError):
                 evaluate.analyze_with_pipeline(np.zeros(16000), "ship", "en")
-        self.assertIs(phones.recognize_phones, original)
+        self.assertEqual((phones.recognize_phones, audio.text2speech), originals)
+
+    def test_reference_audio_is_captured(self):
+        from openpronounce import audio
+
+        def fake_compare(waveform, text, lang="en"):
+            audio.text2speech(text, lang=lang)
+            return {"language": "en", "score": 26.3}
+
+        with patch.object(audio, "text2speech", return_value="cache/tts-1.wav") as text2speech, \
+                patch("openpronounce.speech.compare_audio_with_text", side_effect=fake_compare):
+            _, diagnostics = evaluate.analyze_with_pipeline(np.zeros(16000), "ship", "en")
+            self.assertIs(audio.text2speech, text2speech)  # restored
+        text2speech.assert_called_once_with("ship", lang="en")
+        self.assertEqual(diagnostics["reference_audio"], "cache/tts-1.wav")
+
+    def test_diagnostics_failure_keeps_the_result(self):
+        from openpronounce import phones
+
+        def fake_compare(waveform, text, lang="en"):
+            phones.recognize_phones(waveform, 16000, lang=lang)
+            return {"language": "en", "score": 26.3}
+
+        with patch.object(phones, "recognize_phones", return_value=["tʃ", "y", "p"]), \
+                patch.object(phones, "_word_reports", side_effect=KeyError("position")), \
+                patch("openpronounce.speech.compare_audio_with_text", side_effect=fake_compare):
+            result, diagnostics = evaluate.analyze_with_pipeline(np.zeros(16000), "ship", "en")
+        self.assertEqual(result["score"], 26.3)
+        self.assertIsNone(diagnostics["word_reports"])
+        self.assertEqual(diagnostics["error"]["type"], "KeyError")
+        self.assertIn("position", diagnostics["error"]["traceback"])
+
+    def test_tts_preflight(self):
+        from openpronounce import audio
+
+        with patch.object(audio, "text2speech", side_effect=OSError("no network")) as text2speech:
+            with self.assertRaises(evaluate.PreflightError) as ctx:
+                evaluate.check_tts("en", ["ship", "sheep"])
+        text2speech.assert_called_once_with("ship", lang="en")  # the pipeline's own call
+        self.assertIn("'ship'", str(ctx.exception))
+        self.assertIn("no network", str(ctx.exception))
+        with patch.object(audio, "text2speech", return_value="cache/tts.wav") as text2speech:
+            evaluate.check_tts("en", ["ship", "sheep"])
+        self.assertEqual(text2speech.call_args_list, [call("ship", lang="en"), call("sheep", lang="en")])
+
+    def test_model_revision(self):
+        snapshot = os.path.join("hub", "models--facebook--x", "snapshots", "abc123", "config.json")
+        with patch("huggingface_hub.try_to_load_from_cache", return_value=snapshot) as lookup:
+            self.assertEqual(evaluate.model_revision("facebook/x"), "abc123")
+        lookup.assert_called_once_with("facebook/x", "config.json")
+        # Not cached, cached as missing, or not a repo id (a local directory): unknown.
+        for outcome in ({"return_value": None}, {"return_value": object()},
+                        {"side_effect": ValueError("Repo id must be in the form 'namespace/repo_name'")}):
+            with self.subTest(outcome=outcome), patch("huggingface_hub.try_to_load_from_cache", **outcome):
+                self.assertIsNone(evaluate.model_revision("facebook/x"))
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +573,9 @@ class TestEvaluate(unittest.TestCase):
             ["ship_as_chip_01", "ship", "chip", "intentional_error", "audio/ship_as_chip_01.wav", "ʃ", "ʃ->tʃ"],
             ["ship_broken_01", "ship", "ship", "uncertain", "audio/ship_broken_01.wav", "", ""],
         ])
+        # The TTS reference the fake pipeline "compared against" (a cache file outside the run).
+        self.reference = os.path.join(self.dir, "tts-ship.wav")
+        write_wav(self.reference, sr=16000)
         self.waveform_lengths = []
 
     def tearDown(self):
@@ -376,7 +588,7 @@ class TestEvaluate(unittest.TestCase):
             result = fake_result(94.61, "SHIP", ["ʃ", "ɪ", "p"], [0.99, 0.95, 0.98], [], FEEDBACK_OK)
             reports = [{"position": 0, "word": "ship", "expected": ["ʃ", "ɪ", "p"], "actual": ["ʃ", "ɪ", "p"],
                         "distance": 0, "phones": [], "weighted_edits": 0}]
-            return result, {"word_reports": reports}
+            return result, {"word_reports": reports, "reference_audio": self.reference}
         if n == 2:
             # The ship -> chip case of docs/vision.md §7: low score, no flagged word, positive feedback.
             result = fake_result(26.3, "TRIP", ["tʃ", "y", "p"], [0.91, 0.12, 0.98], [], FEEDBACK_OK)
@@ -385,21 +597,36 @@ class TestEvaluate(unittest.TestCase):
                         "phones": [{"expected": "ʃ", "heard": "tʃ", "confidence": 1.0},
                                    {"expected": "ɪ", "heard": "y", "confidence": 0.1},
                                    {"expected": "p", "heard": "p", "confidence": 0.0}]}]
-            return result, {"word_reports": reports}
+            return result, {"word_reports": reports, "reference_audio": self.reference}
         raise RuntimeError("synthetic pipeline failure")
 
-    def run_main(self, *extra, preflight=None):
+    def run_main(self, *extra, preflight=None, analyze=None):
         argv = ["--corpus", self.csv, "--out", self.out, *extra]
-        return evaluate.main(argv, analyze=self.fake_analyze, preflight=preflight or (lambda lang: None))
+        return evaluate.main(argv, analyze=analyze or self.fake_analyze,
+                             preflight=preflight or (lambda lang, texts: None))
+
+    def run_dir(self):
+        (run_dir,) = glob.glob(os.path.join(self.out, "*"))
+        return run_dir
+
+    def read_json(self, *path):
+        with open(os.path.join(*path), encoding="utf-8") as f:
+            return json.load(f)
 
     def test_end_to_end(self):
-        self.assertEqual(self.run_main("--name", "smoke"), 0)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(self.run_main("--name", "smoke"), 0)
         run_dirs = glob.glob(os.path.join(self.out, "*-smoke"))
         self.assertEqual(len(run_dirs), 1)
         run_dir = run_dirs[0]
         for name in ("run.json", "results.jsonl", "report.md", "raw/ship_good_01.json",
                      "raw/ship_as_chip_01.json", "raw/ship_broken_01.json"):
             self.assertTrue(os.path.isfile(os.path.join(run_dir, name)), name)
+        # The final console line shows the run directory with forward slashes only.
+        last_line = stdout.getvalue().splitlines()[-1]
+        self.assertTrue(last_line.startswith(evaluate._display_path(run_dir) + ":"), last_line)
+        self.assertNotIn("\\", last_line)
 
         # The waveform handed to the pipeline is 16 kHz (the files are 44.1 kHz, 0.5 s).
         self.assertEqual(self.waveform_lengths[0], 8000)
@@ -414,10 +641,25 @@ class TestEvaluate(unittest.TestCase):
             self.assertEqual(raw["audio"]["sha256"], hashlib.sha256(f.read()).hexdigest())
         self.assertAlmostEqual(raw["audio"]["duration_s"], 0.5, places=2)
 
+        # The TTS reference behind acoustic_distance is copied into the run and hashed.
+        with open(self.reference, "rb") as f:
+            reference_sha = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(raw["reference"]["path"], "references/ship_as_chip_01.wav")
+        self.assertEqual(raw["reference"]["sha256"], reference_sha)
+        self.assertEqual(raw["reference"]["source"], evaluate._display_path(self.reference))
+        self.assertNotIn("reference_audio", raw["diagnostics"])
+        with open(os.path.join(run_dir, "references", "ship_as_chip_01.wav"), "rb") as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), reference_sha)
+        # Only the first analyzed sample pays the lazy model loading.
+        self.assertTrue(self.read_json(run_dir, "raw", "ship_good_01.json")["cold_start"])
+        self.assertFalse(raw["cold_start"])
+
         with open(os.path.join(run_dir, "raw", "ship_broken_01.json"), encoding="utf-8") as f:
             broken = json.load(f)
         self.assertIsNone(broken["result"])
+        self.assertIsNone(broken["reference"])
         self.assertEqual(broken["error"]["type"], "RuntimeError")
+        self.assertEqual(broken["error"]["stage"], "analysis")
         self.assertIn("synthetic pipeline failure", broken["error"]["traceback"])
 
         with open(os.path.join(run_dir, "results.jsonl"), encoding="utf-8") as f:
@@ -431,19 +673,23 @@ class TestEvaluate(unittest.TestCase):
         self.assertTrue(chip["flags"]["asr_mismatch"])
         self.assertEqual(chip["heard_phones"], ["tʃ", "y", "p"])
         self.assertEqual(chip["acoustic_distance"], 7.5)
-        self.assertEqual(chip["word_edits"], [{"word": "ship", "n_phones": 3, "distance": 2,
+        self.assertEqual(chip["word_edits"], [{"word": "ship", "position": 0, "n_phones": 3, "distance": 2,
                                                "weighted_edits": 1.1, "reported": False}])
+        self.assertEqual(chip["reference_sha256"], reference_sha)
         self.assertEqual(rows["ship_good_01"]["detection"], "TN")
         self.assertEqual(rows["ship_broken_01"]["detection"], "NA")
         self.assertEqual(rows["ship_broken_01"]["error"]["type"], "RuntimeError")
 
         with open(os.path.join(run_dir, "run.json"), encoding="utf-8") as f:
             run = json.load(f)
+        self.assertEqual(run["status"], "completed")
         self.assertEqual(run["lang"], "en")
-        self.assertEqual(run["counts"], {"selected": 3, "processed": 2, "failed": 1, "missing": 0})
+        self.assertEqual(run["counts"], {"selected": 3, "processed": 2, "failed": 1, "not_run": 0, "missing": 0})
         self.assertIn("PHONE_ERROR_THRESHOLD", run["phone_thresholds"])
         self.assertIn("transformers", run["versions"])
         self.assertIn("commit", run["git"])
+        self.assertEqual(set(run["model_revisions"]),
+                         {run["asr_model"], run["embedding_model"], run["phone_model"]["name"]})
         self.assertEqual(len(run["corpus"]["sha256"]), 64)
         self.assertIsNotNone(run["finished_at"])
 
@@ -455,6 +701,116 @@ class TestEvaluate(unittest.TestCase):
         self.assertIn("ʃ → tʃ", markdown)
         self.assertIn("n/a", markdown)  # precision: no flagged word at all
         self.assertIn("synthetic pipeline failure", markdown)
+        self.assertIn("ship_good_01 (", markdown)  # the cold-start note
+        self.assertIn("includes lazy model loading", markdown)
+
+    def test_preflight_gets_the_distinct_texts(self):
+        calls = []
+        self.assertEqual(self.run_main(preflight=lambda lang, texts: calls.append((lang, texts))), 0)
+        self.assertEqual(calls, [("en", ["ship"])])
+
+    def test_cold_start_is_the_first_analyzed_sample(self):
+        # The first sample fails before reaching the pipeline, so the second one loads the models.
+        load_audio = evaluate.load_audio
+
+        def flaky_load(path):
+            if "ship_good_01" in path:
+                raise RuntimeError("cannot decode")
+            return load_audio(path)
+
+        with patch.object(evaluate, "load_audio", side_effect=flaky_load):
+            self.assertEqual(self.run_main(), 0)
+        raw = [self.read_json(self.run_dir(), "raw", f"{i}.json") for i in
+               ("ship_good_01", "ship_as_chip_01", "ship_broken_01")]
+        self.assertEqual([r["cold_start"] for r in raw], [False, True, False])
+
+    def test_run_json_is_written_at_start(self):
+        statuses = []
+
+        def analyze(waveform, expected_text, lang):
+            statuses.append(self.read_json(self.run_dir(), "run.json")["status"])
+            return self.fake_analyze(waveform, expected_text, lang)
+
+        self.assertEqual(self.run_main(analyze=analyze), 0)
+        self.assertEqual(statuses[0], "running")
+        self.assertEqual(self.read_json(self.run_dir(), "run.json")["status"], "completed")
+
+    def test_interrupted_run_keeps_partial_results(self):
+        def analyze(waveform, expected_text, lang):
+            if self.waveform_lengths:
+                raise KeyboardInterrupt
+            return self.fake_analyze(waveform, expected_text, lang)
+
+        self.assertEqual(self.run_main(analyze=analyze), evaluate.EXIT_INTERRUPTED)
+        run_dir = self.run_dir()
+        run = self.read_json(run_dir, "run.json")
+        self.assertEqual(run["status"], "interrupted")
+        self.assertIsNotNone(run["finished_at"])
+        self.assertEqual(run["counts"], {"selected": 3, "processed": 1, "failed": 0, "not_run": 2, "missing": 0})
+        with open(os.path.join(run_dir, "results.jsonl"), encoding="utf-8") as f:
+            self.assertEqual(len(f.read().splitlines()), 1)
+        with open(os.path.join(run_dir, "report.md"), encoding="utf-8") as f:
+            markdown = f.read()
+        self.assertIn("interrupted", markdown)
+        self.assertIn("ship_good_01", markdown)
+        self.assertNotIn("ship_as_chip_01", markdown)
+
+    def test_aborted_run_is_recorded_and_raised(self):
+        with patch.object(evaluate, "derive_row", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.run_main()
+        run = self.read_json(self.run_dir(), "run.json")
+        self.assertEqual(run["status"], "aborted")
+        self.assertIn("disk full", run["abort_error"])
+
+    def test_row_derivation_failure_is_isolated(self):
+        def analyze(waveform, expected_text, lang):
+            result, diagnostics = self.fake_analyze(waveform, expected_text, lang)
+            if len(self.waveform_lengths) == 1:
+                result["differences"]["errors"] = ["not a dict"]  # breaks report.result_row
+            return result, diagnostics
+
+        self.assertEqual(self.run_main(analyze=analyze), 0)
+        run_dir = self.run_dir()
+        raw = self.read_json(run_dir, "raw", "ship_good_01.json")
+        self.assertEqual(raw["result"]["score"], 94.61)  # the pipeline output is kept
+        self.assertEqual(raw["error"]["stage"], "row")
+        self.assertEqual(raw["error"]["type"], "AttributeError")
+        with open(os.path.join(run_dir, "results.jsonl"), encoding="utf-8") as f:
+            rows = {r["sample_id"]: r for r in map(json.loads, f.read().splitlines())}
+        self.assertEqual(rows["ship_good_01"]["detection"], "NA")
+        self.assertEqual(rows["ship_good_01"]["error"]["stage"], "row")
+        self.assertEqual(rows["ship_as_chip_01"]["detection"], "FN")  # the run went on
+        self.assertEqual(self.read_json(run_dir, "run.json")["counts"]["failed"], 2)
+
+    def test_no_run_dir_when_run_metadata_fails(self):
+        with patch.object(evaluate, "pipeline_info", side_effect=RuntimeError("torch broken")):
+            with self.assertRaises(RuntimeError):
+                self.run_main()
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_exit_codes(self):
+        codes = [evaluate.EXIT_INVALID_CORPUS, evaluate.EXIT_PREFLIGHT_FAILED, evaluate.EXIT_NOTHING_TO_EVALUATE,
+                 evaluate.EXIT_INTERRUPTED]
+        self.assertEqual(len(set(codes)), len(codes))
+        # 0 done, 1 Python's own exit code for a traceback, 2 argparse's for a usage error.
+        self.assertTrue(set(codes).isdisjoint({0, 1, 2}))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+            self.run_main("--name", "not valid")
+        self.assertEqual(ctx.exception.code, 2)
+        for name in ("ship_good_01", "ship_as_chip_01", "ship_broken_01"):
+            os.remove(os.path.join(self.dir, "audio", f"{name}.wav"))
+        self.assertEqual(self.run_main("--skip-missing"), evaluate.EXIT_NOTHING_TO_EVALUATE)
+
+    def test_run_dir_naming(self):
+        with patch.object(evaluate, "datetime") as clock:
+            clock.datetime.now.return_value = datetime.datetime(2026, 10, 7, 9, 48, 35)
+            first = evaluate.make_run_dir(self.out, "baseline")
+            second = evaluate.make_run_dir(self.out, "baseline")
+            unnamed = evaluate.make_run_dir(self.out, None)
+        self.assertEqual([os.path.basename(p) for p in (first, second, unnamed)],
+                         ["20261007-094835-baseline", "20261007-094835-baseline-2", "20261007-094835"])
+        self.assertTrue(os.path.isdir(os.path.join(first, "raw")))
 
     def test_validate_only(self):
         self.assertEqual(self.run_main("--validate-only"), 0)
@@ -469,20 +825,21 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual(self.run_main("--skip-missing", "--only", "ship_good_01", "ship_as_chip_01"), 0)
         (run_dir,) = glob.glob(os.path.join(self.out, "*"))
         with open(os.path.join(run_dir, "run.json"), encoding="utf-8") as f:
-            self.assertEqual(json.load(f)["counts"], {"selected": 1, "processed": 1, "failed": 0, "missing": 1})
+            self.assertEqual(json.load(f)["counts"],
+                             {"selected": 1, "processed": 1, "failed": 0, "not_run": 0, "missing": 1})
 
     def test_invalid_corpus_stops_before_preflight(self):
         write_csv(self.csv, HEADER, [["x", "ship", "ship", "nope", "audio/ship_good_01.wav"]])
         preflight_calls = []
-        self.assertNotEqual(self.run_main(preflight=preflight_calls.append), 0)
+        self.assertEqual(self.run_main(preflight=lambda *a: preflight_calls.append(a)), evaluate.EXIT_INVALID_CORPUS)
         self.assertEqual(preflight_calls, [])
         self.assertFalse(os.path.exists(self.out))
 
     def test_preflight_failure(self):
-        def broken_preflight(lang):
+        def broken_preflight(lang, texts):
             raise evaluate.PreflightError("espeak-ng returned no phones")
 
-        self.assertNotEqual(self.run_main(preflight=broken_preflight), 0)
+        self.assertEqual(self.run_main(preflight=broken_preflight), evaluate.EXIT_PREFLIGHT_FAILED)
         self.assertEqual(self.waveform_lengths, [])
         self.assertFalse(os.path.exists(self.out))
 
