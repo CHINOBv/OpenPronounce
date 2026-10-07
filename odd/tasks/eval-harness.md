@@ -59,11 +59,11 @@ Pronunciation logic must not be changed before there is a controlled, reproducib
 | T2 | delegated writer (2+ non-trivial files) | 60b688b | RED: ModuleNotFoundError then 33 AttributeError; GREEN: tests/test_lab.py 28 passed + 8 subtests; full suite 127 passed; parent spot check 127 passed, example.csv validate-only exit 0 | high (subprocess + shell launcher); consent granted by user; 4-lens approved (review-90917fcc), 10 advisory; branch-vs-main review granted by user, approved (review-20251f12), 9 advisory |
 | T3 | delegated verification | — (no source change) | real models: example.csv 8 ok / 0 failed, 35.9 s (run `lab/runs/20261007-094835-smoke`); launcher `--only asset_developer` exit 0; raw/results/run/report consistent; parent spot check of run dir and summary | n/a |
 | T3b | delegated writer | e1e1d18 | RED: 25 failed / 29 passed after new tests; GREEN: tests/test_lab.py 52 passed + 29 subtests; full suite 151 passed; real run `lab/runs/20261007-100618-t3b` 8/0, 32.7 s, references hashed, 2 model revisions, status completed; parent spot check 151 passed + run.json readback | medium (slice budget); consent granted by user; 1-lens review approved (review-838144ff), 3 advisory; branch-vs-main review granted by user, approved (review-ff7361e4), 8 advisory |
-| T5 | delegated writer | see T5 commit | RED: import error + 3 failing in test_lab.py; GREEN: 96 lab tests; full suite 195 passed; `--list-devices` via Python and `record-lab.ps1` exit 0; parent spot check 195 passed + launcher | pending assess |
+| T5 | delegated writer | ebaff5f | RED: import error + 3 failing in test_lab.py; GREEN: 96 lab tests; full suite 195 passed; `--list-devices` via Python and `record-lab.ps1` exit 0; parent spot check 195 passed + launcher | high (subprocess); consent granted by user; 4-lens approved (review-fe9ad81c), 12 advisory incl. broken `.ecord-lab.ps1` in CLAUDE.md (stray CR, fixed in follow-up), non-atomic keep step; branch-vs-main review stopped with lens_context_budget_exceeded (covered by per-commit reviews) |
 
 ## Next step
 
-T4 re-recording (user) with `.ecord-lab.ps1` after disabling Windows microphone enhancements; then the baseline run.
+T4 re-recording (user) with `.\record-lab.ps1` after disabling Windows microphone enhancements; then the baseline run.
 
 ## Notes
 

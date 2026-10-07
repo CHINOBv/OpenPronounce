@@ -34,7 +34,7 @@ uv pip install --python .venv/Scripts/python.exe -e ".[app,dev]"
 # Evaluation harness (lab/README.md): labeled recordings -> lab/runs/<timestamp>/
 ./run-lab.sh --validate-only                     # Git Bash; .\run-lab.ps1 in PowerShell
 ./run-lab.sh --name baseline --skip-missing      # all flags: python -m lab.evaluate --help
-.ecord-lab.ps1                                 # PowerShell: record missing takes (raw + trimmed + sidecar); python -m lab.record --help
+.\record-lab.ps1                                 # PowerShell: record missing takes (raw + trimmed + sidecar); python -m lab.record --help
 ```
 
 Windows notes: `python` on PATH is the Microsoft Store alias; always use `.venv/Scripts/python.exe`. espeak-ng is expected at `C:\Program Files\eSpeak NG` and ffmpeg in the WinGet package dir (see `run-local.*`). Models download from Hugging Face on first run.
