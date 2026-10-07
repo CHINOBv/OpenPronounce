@@ -33,6 +33,8 @@ Pronunciation logic must not be changed before there is a controlled, reproducib
 - [x] **T2 Harness core (Phase 1).** `lab/` package: corpus CSV schema + validation, `python -m lab.evaluate`, raw JSON per sample, `results.jsonl`, `run.json`, `report.md`; unit tests with an injected fake pipeline; `lab/README.md` recording guide; `run-lab.*` launchers; gitignore audio and runs. Route: delegated writer (2+ non-trivial files).
 - [x] **T3 End-to-end smoke run.** Run the harness with the real models on an example corpus built from `assets/`; fix defects found; record evidence. Route: delegated verification.
 - [x] **T3b Harness hardening.** Fix the review/T3 findings worth fixing: case-insensitive id collisions, per-sample isolation of row derivation and diagnostics, run.json written at start, distinct exit codes, TTS preflight, reference audio preserved + hashed, model revisions, report fixes (confidence truncation, missing words_with_errors, word positions, 3-decimal edits, path display, TTS label, first-sample load note), blank leading CSV lines, guard test for the restated reporting rule. Route: delegated writer.
+- [x] **T4a First recording attempt (user).** 5 `ship` takes via `ffmpeg -f dshow -t 3`: run `lab/runs/20261007-104447-baseline` scored 10–29 for all (TP0 FP0 TN2 FN3). Trim experiment `lab/runs/20261007-104609-trimmed-experiment` (same audio, silence trimmed): `ship_good_02` 29→72, ASR SHIPLEFF/SHIV→SHIP. Recording setup, not pronunciation, explains most of the low scores. Feedback bug reproduced: `ship_as_chip_01` (ASR "CHIP", heard /tʃ/ 0.77) → "excellent". Audio archived in `lab/corpus/audio/archive/20261007-ffmpeg-3s/`.
+- [x] **T5 Recording helper.** `python -m lab.record`: press-to-start/press-to-stop capture via ffmpeg, keeps the raw take, writes a silence-trimmed take for evaluation, reports level/noise floor and warns on digital-silence gating; corpus extended to several takes per contrast. Route: delegated writer.
 - [ ] **T4 First personal corpus (user).** Record the 5 `ship` samples (2× good, sheep, chip, sip) per `lab/README.md`; then run the first baseline. Owner: user.
 
 ## Acceptance criteria
@@ -57,10 +59,11 @@ Pronunciation logic must not be changed before there is a controlled, reproducib
 | T2 | delegated writer (2+ non-trivial files) | 60b688b | RED: ModuleNotFoundError then 33 AttributeError; GREEN: tests/test_lab.py 28 passed + 8 subtests; full suite 127 passed; parent spot check 127 passed, example.csv validate-only exit 0 | high (subprocess + shell launcher); consent granted by user; 4-lens approved (review-90917fcc), 10 advisory; branch-vs-main review granted by user, approved (review-20251f12), 9 advisory |
 | T3 | delegated verification | — (no source change) | real models: example.csv 8 ok / 0 failed, 35.9 s (run `lab/runs/20261007-094835-smoke`); launcher `--only asset_developer` exit 0; raw/results/run/report consistent; parent spot check of run dir and summary | n/a |
 | T3b | delegated writer | e1e1d18 | RED: 25 failed / 29 passed after new tests; GREEN: tests/test_lab.py 52 passed + 29 subtests; full suite 151 passed; real run `lab/runs/20261007-100618-t3b` 8/0, 32.7 s, references hashed, 2 model revisions, status completed; parent spot check 151 passed + run.json readback | medium (slice budget); consent granted by user; 1-lens review approved (review-838144ff), 3 advisory; branch-vs-main review granted by user, approved (review-ff7361e4), 8 advisory |
+| T5 | delegated writer | see T5 commit | RED: import error + 3 failing in test_lab.py; GREEN: 96 lab tests; full suite 195 passed; `--list-devices` via Python and `record-lab.ps1` exit 0; parent spot check 195 passed + launcher | pending assess |
 
 ## Next step
 
-T4 (user recordings), then the first personal baseline run.
+T4 re-recording (user) with `.ecord-lab.ps1` after disabling Windows microphone enhancements; then the baseline run.
 
 ## Notes
 
@@ -73,3 +76,4 @@ T4 (user recordings), then the first personal baseline run.
 - T3b exit codes: 3 invalid corpus, 4 preflight failed, 5 nothing to evaluate, 130 interrupted (1/2 stay Python/argparse). TTS preflight synthesizes every distinct `expected_text` through the pipeline's cached call (one-word check would pass vacuously once cached).
 - T3b open issues: a `report.md` write failure after `run.json` says completed is not isolated; model revisions come from the HF cache main snapshot, not the loaded config's `_commit_hash`.
 - Open follow-ups from the final reviews (non-blocking): `report.md` is rendered after `run.json` is marked completed and is not isolated (`lab/evaluate.py:378-381`); a console encoding error while printing progress can abort a run without `PYTHONUTF8=1` (`lab/evaluate.py:357-362`); an interrupt before the run starts returns the generic exit code (`lab/evaluate.py:423-427`); reference-copy failure path is untested.
+- T5: the archived silence is ~98% exact zeros plus sparse ±1 LSB (noise floor ≈ 3.7e-6), so the gating warning fires below one 16-bit step instead of `== 0`. Not yet exercised against the real microphone (stop with `q`, start detection). `report.md` does not show recording warnings yet.

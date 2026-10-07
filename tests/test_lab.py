@@ -709,6 +709,32 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual(self.run_main(preflight=lambda lang, texts: calls.append((lang, texts))), 0)
         self.assertEqual(calls, [("en", ["ship"])])
 
+    def test_recording_sidecar_is_kept(self):
+        # lab.record writes <stem>.recording.json next to the take; the run carries it as evidence.
+        sidecar = {"device": "Micrófono (Realtek(R) Audio)", "warnings": ["digital_gating"],
+                   "stats": {"noise_floor": 0.0}}
+        with open(os.path.join(self.dir, "audio", "ship_good_01.recording.json"), "w", encoding="utf-8") as f:
+            json.dump(sidecar, f, ensure_ascii=False)
+        with open(os.path.join(self.dir, "audio", "ship_as_chip_01.recording.json"), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual(self.run_main(), 0)
+        run_dir = self.run_dir()
+        self.assertEqual(self.read_json(run_dir, "raw", "ship_good_01.json")["recording"], sidecar)
+        # An unreadable sidecar is recorded as such; the sample itself still runs.
+        chip = self.read_json(run_dir, "raw", "ship_as_chip_01.json")
+        self.assertIn("JSONDecodeError", chip["recording"]["error"])
+        self.assertEqual(chip["result"]["score"], 26.3)
+        self.assertIsNone(self.read_json(run_dir, "raw", "ship_broken_01.json")["recording"])
+        with open(os.path.join(run_dir, "results.jsonl"), encoding="utf-8") as f:
+            rows = {r["sample_id"]: r for r in map(json.loads, f.read().splitlines())}
+        self.assertEqual(rows["ship_good_01"]["recording_warnings"], ["digital_gating"])
+        self.assertIsNone(rows["ship_as_chip_01"]["recording_warnings"])
+        self.assertIsNone(rows["ship_broken_01"]["recording_warnings"])  # failed sample, no sidecar
+
+    def test_recording_path(self):
+        self.assertEqual(evaluate.recording_path(os.path.join("audio", "ship_good_01.wav")),
+                         os.path.join("audio", "ship_good_01.recording.json"))
+
     def test_cold_start_is_the_first_analyzed_sample(self):
         # The first sample fails before reaching the pipeline, so the second one loads the models.
         load_audio = evaluate.load_audio
@@ -850,8 +876,19 @@ class TestCorpusFiles(unittest.TestCase):
     def test_samples_csv(self):
         result = corpus.load_corpus(os.path.join(REPO_ROOT, "lab", "corpus", "samples.csv"), skip_missing=True)
         ids = [s.sample_id for s in result.samples + result.missing]
-        self.assertEqual(ids, ["ship_good_01", "ship_good_02", "ship_as_sheep_01", "ship_as_chip_01",
-                               "ship_as_sip_01"])
+        self.assertEqual(ids, ["ship_good_01", "ship_good_02", "ship_good_03", "ship_good_04",
+                               "ship_as_sheep_01", "ship_as_sheep_02", "ship_as_sheep_03",
+                               "ship_as_chip_01", "ship_as_chip_02", "ship_as_chip_03",
+                               "ship_as_sip_01", "ship_as_sip_02", "ship_as_sip_03"])
+        # Every take of a contrast is labeled the same way.
+        by_contrast = {}
+        for s in result.samples + result.missing:
+            by_contrast.setdefault(s.sample_id.rsplit("_", 1)[0], set()).add(
+                (s.expected_text, s.fields["intended_pronunciation"], s.label, s.fields["intended_substitution"]))
+        self.assertEqual({k: len(v) for k, v in by_contrast.items()},
+                         {"ship_good": 1, "ship_as_sheep": 1, "ship_as_chip": 1, "ship_as_sip": 1})
+        self.assertTrue(all(s.fields["audio_file"] == f"audio/{s.sample_id}.wav"
+                            for s in result.samples + result.missing))
 
     def test_example_csv(self):
         result = corpus.load_corpus(os.path.join(REPO_ROOT, "lab", "corpus", "example.csv"))

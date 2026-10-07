@@ -34,6 +34,7 @@ uv pip install --python .venv/Scripts/python.exe -e ".[app,dev]"
 # Evaluation harness (lab/README.md): labeled recordings -> lab/runs/<timestamp>/
 ./run-lab.sh --validate-only                     # Git Bash; .\run-lab.ps1 in PowerShell
 ./run-lab.sh --name baseline --skip-missing      # all flags: python -m lab.evaluate --help
+.ecord-lab.ps1                                 # PowerShell: record missing takes (raw + trimmed + sidecar); python -m lab.record --help
 ```
 
 Windows notes: `python` on PATH is the Microsoft Store alias; always use `.venv/Scripts/python.exe`. espeak-ng is expected at `C:\Program Files\eSpeak NG` and ffmpeg in the WinGet package dir (see `run-local.*`). Models download from Hugging Face on first run.
@@ -50,7 +51,7 @@ Windows notes: `python` on PATH is the Microsoft Store alias; always use `.venv/
 | `openpronounce/cli.py` | CLI entry point |
 | `server.py` | FastAPI web UI + JSON API |
 | `benchmarks/` | speechocean762 and word-detection benchmarks |
-| `lab/` | Personal evaluation harness: corpus CSV, `python -m lab.evaluate`, raw outputs and report per run |
+| `lab/` | Personal evaluation harness: corpus CSV, `lab/record.py` (recording helper), `python -m lab.evaluate`, raw outputs and report per run |
 | `tests/` | pytest suite |
 
 Known fact: `_feedback` (`speech.py`) depends only on word-level errors, not on the score. Word errors are gated by `PHONE_ERROR_THRESHOLD`, `PHONE_ERROR_MIN_EDITS`, and `NEAR_PHONE_COST` (`phones.py`).

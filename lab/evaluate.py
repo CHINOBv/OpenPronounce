@@ -293,15 +293,35 @@ def keep_reference(source, references_dir, sample_id):
             "source": _display_path(source)}
 
 
+def recording_path(audio_path):
+    """Sidecar that ``python -m lab.record`` writes next to a take: ``<stem>.recording.json``."""
+    return os.path.splitext(audio_path)[0] + ".recording.json"
+
+
+def read_recording(audio_path):
+    """The recording sidecar of ``audio_path``; None without one, ``{"error": ...}`` when unreadable."""
+    path = recording_path(audio_path)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:  # ValueError covers JSONDecodeError and bad UTF-8
+        return {"error": f"{type(e).__name__}: {e}"}
+    return data if isinstance(data, dict) else {"error": "the sidecar is not a JSON object"}
+
+
 def evaluate_sample(sample, analyze, lang, references_dir, cold_start=False):
     """Raw record of one sample. A failure is recorded in ``error``, never raised.
 
     ``cold_start`` marks the first analysis of the run: its ``elapsed_s`` includes the lazy
     loading of the models. It is recorded only when the sample reaches the analyzer.
+    ``recording`` is the take's lab.record sidecar, None when it has none.
     """
     record = {
         "sample": sample.fields,
         "audio": {"path": _display_path(sample.audio_path), "sha256": None, "duration_s": None},
+        "recording": read_recording(sample.audio_path),
         "reference": None,
         "result": None,
         "diagnostics": None,
@@ -333,12 +353,17 @@ def evaluate_sample(sample, analyze, lang, references_dir, cold_start=False):
 
 
 def derive_row(record):
-    """``report.result_row(record)``; a failure is recorded on the record (stage "row"), never raised."""
+    """``report.result_row(record)`` plus ``recording_warnings`` (None without a sidecar).
+
+    A failure is recorded on the record (stage "row"), never raised.
+    """
     try:
-        return report.result_row(record)
+        row = report.result_row(record)
     except Exception as e:  # noqa: BLE001 - one malformed result must not abort the run
         record["error"] = _error_info(e, "row")
-        return report.result_row(dict(record, result=None, diagnostics=None))
+        row = report.result_row(dict(record, result=None, diagnostics=None))
+    row["recording_warnings"] = (record.get("recording") or {}).get("warnings")
+    return row
 
 
 def _evaluate_samples(samples, analyze, lang, run_dir, rows, word_reports):
